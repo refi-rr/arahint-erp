@@ -11,15 +11,15 @@ Membangun arahint-erp — ERP in-house yang dijual sebagai produk ke perusahaan 
 
 ## Not yet specified
 
-Kedalaman dan bentuk rincian per modul setelah inventaris awal; apakah modul Website/eCommerce ikut di versi pertama; lisensi produk arahint-erp sendiri; dan bentuk deployment multi-tenant — belum bisa dirumuskan sebelum batas penyalinan kode dan model deployment diputuskan.
+Kedalaman dan bentuk rincian per entitas setelah inventaris modul; bentuk paket instalasi dan jalur upgrade bagi pelanggan single-tenant; serta cara instance observasi dibersihkan dan diisi ulang antar sesi riset — belum bisa dirumuskan sebelum stack dan lisensi diputuskan.
 
 ## Notes
 
-Acuan tunggal adalah ERPNext; tidak ada pembanding eksternal. Riset mencakup seluruh modul bisnis ERPNext v15 tanpa terkecuali, dan kerangka dasar Frappe ikut dibangun karena modul bisnisnya tidak berjalan tanpa itu. Paritas yang dituju adalah paritas fungsional: model data, nama field, dan UI dirancang sendiri. Riset per modul berhenti di tingkat inventaris (daftar fitur, entitas inti, alur utama). Ada satu instance ERPNext v15 untuk observasi saja, bukan bagian dari deployment arahint-erp. Pilihan teknologi dasar dibiarkan terbuka sebagai tiket keputusan sendiri. Hasil riset ditujukan langsung untuk dipakai Agent Floor arahint-erp sebagai batch issue.
+Acuan tunggal adalah ERPNext; tidak ada pembanding eksternal. Riset mencakup seluruh modul bisnis ERPNext v15 tanpa terkecuali, dan kerangka dasar Frappe ikut dibangun karena modul bisnisnya tidak berjalan tanpa itu. Paritas yang dituju adalah paritas fungsional: model data, nama field, dan UI dirancang sendiri, dan tidak ada kode, skema, atau file ERPNext yang disalin — ERPNext hanya dijadikan acuan perilaku lewat instance observasi. Riset per modul berhenti di tingkat inventaris (daftar fitur, entitas inti, alur utama). Versi pertama dirilis single-tenant per perusahaan, dengan multi-company dan multi-currency masuk sejak awal dan lokalisasi Indonesia (PPN, e-Faktur) menyusul sebagai tiket tersendiri setelah modul inti. Pilihan teknologi dasar dibiarkan terbuka sebagai tiket keputusan sendiri. Hasil riset ditujukan langsung untuk dipakai Agent Floor arahint-erp sebagai batch issue.
 
 ## Out of scope
 
-Perbandingan dengan ERP lain (Odoo dan sejenisnya) — Owner memilih ERPNext saja sebagai acuan. Instance observasi ERPNext sebagai bagian dari deployment arahint-erp — ia hanya untuk pengamatan, tidak ikut dirilis.
+Perbandingan dengan ERP lain (Odoo dan sejenisnya) — Owner memilih ERPNext saja sebagai acuan. Instance observasi ERPNext sebagai bagian dari deployment arahint-erp — ia hanya untuk pengamatan, tidak ikut dirilis. SaaS multi-tenant — ditunda; versi pertama single-tenant per perusahaan.
 
 ## Hasil yang diharapkan
 
@@ -44,3 +44,6 @@ Settled in Grilling Session 3, word for word:
 13. Ada satu instance ERPNext v15 (Frappe bench) yang berjalan hanya untuk observasi — inventaris fitur, alur, dan tangkapan layar — dan bukan bagian dari deployment arahint-erp.
 14. Riset per modul berhenti di tingkat inventaris: daftar fitur, entitas inti, dan alur utama; rincian field per entitas menjadi tiket per modul.
 15. Peta ini menghasilkan satu PRD sebagai peta modul plus satu tiket build per modul yang diurutkan berdasarkan ketergantungan (Accounting, Stock, Buying, Selling lebih dulu), tanpa tiket riset terpisah kecuali yang benar-benar membuka keputusan.
+16. arahint-erp dirilis single-tenant per perusahaan (self-hosted) lebih dulu, dan SaaS multi-tenant ditunda serta dicatat sebagai out of scope.
+17. Multi-company dan multi-currency masuk cakupan sejak awal, sedangkan lokalisasi Indonesia (PPN dan e-Faktur) menjadi tiket tersendiri setelah modul inti.
+18. ERPNext dipakai sebagai acuan perilaku saja: tidak ada kode, skema, atau file ERPNext yang disalin ke arahint-erp, dan ERPNext hanya dijalankan sebagai instance observasi untuk melihat perilakunya.
