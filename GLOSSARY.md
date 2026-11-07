@@ -19,3 +19,7 @@ Model rilis arahint-erp di mana setiap perusahaan pelanggan menjalankan instance
 
 **Lokalisasi Indonesia**:
 Lapisan aturan pajak dan dokumen resmi Indonesia (PPN, e-Faktur) yang dibangun sebagai tiket tersendiri setelah modul inti. Avoid: l10n, localisation.
+
+**Modul inti**:
+Kelompok modul yang dibangun paling awal — Accounting, Stock, Buying, dan Selling — dan menjadi prasyarat bagi modul lain, Website/eCommerce, serta migrasi data.
+_Avoid_: modul dasar, core module
