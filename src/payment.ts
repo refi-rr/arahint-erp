@@ -48,6 +48,28 @@ export interface PaymentBookOptions {
 }
 
 /**
+ * Menggabungkan alokasi yang menunjuk invoice yang sama menjadi satu
+ * alokasi. Tanpa penggabungan, satu invoice bisa muncul dua kali dalam satu
+ * pembayaran: jurnal akan mem-post piutang dua kali, padahal hanya satu
+ * yang bisa terpakai karena sisa tagihan sudah habis.
+ */
+function aggregateAllocations(allocations: readonly PaymentAllocation[]): PaymentAllocation[] {
+  const merged = new Map<string, PaymentAllocation>();
+  for (const allocation of allocations) {
+    const existing = merged.get(allocation.invoiceId);
+    if (existing === undefined) {
+      merged.set(allocation.invoiceId, allocation);
+      continue;
+    }
+    merged.set(allocation.invoiceId, {
+      invoiceId: allocation.invoiceId,
+      amount: existing.amount.add(allocation.amount),
+    });
+  }
+  return [...merged.values()];
+}
+
+/**
  * Buku pembayaran: menyimpan invoice dan payment entry, serta memposting
  * jurnal kas/bank ketika sebuah pembayaran disubmit.
  */
@@ -89,6 +111,10 @@ export class PaymentBook {
    * Membuat payment entry dalam keadaan draft dan memvalidasinya: alokasi
    * tidak boleh melebihi nilai pembayaran, tidak boleh melebihi sisa invoice,
    * dan invoice yang dipakai harus cocok party serta jenisnya.
+   *
+   * Alokasi ke invoice yang sama digabung menjadi satu alokasi. Tanpa itu,
+   * satu invoice bisa terisi dua kali dalam satu pembayaran sehingga jurnal
+   * mem-post piutang dua kali sementara hanya satu yang terpakai.
    */
   createPayment(input: {
     id: string;
@@ -104,8 +130,8 @@ export class PaymentBook {
     if (!input.amount.isPositive()) {
       throw new DomainError("payment_amount_not_positive", "Nominal pembayaran harus positif");
     }
-    const allocations = input.allocations ?? [];
-    for (const allocation of allocations) {
+    const rawAllocations = input.allocations ?? [];
+    for (const allocation of rawAllocations) {
       if (!allocation.amount.isPositive()) {
         throw new DomainError(
           "allocation_amount_not_positive",
@@ -119,6 +145,7 @@ export class PaymentBook {
         );
       }
     }
+    const allocations = aggregateAllocations(rawAllocations);
 
     let allocatedTotal = input.amount.subtract(input.amount);
     for (const allocation of allocations) {
@@ -196,19 +223,30 @@ export class PaymentBook {
     const isReceive = payment.mode === "receive";
     let advanceTotal = payment.unallocated;
 
+    // Rencana posting dihitung lebih dulu untuk semua invoice, termasuk
+    // invoice yang sudah diperbarui, supaya jurnal tidak pernah tersimpan
+    // kalau ada alokasi yang tidak bisa diterapkan.
+    const plan: { invoiceId: string; updated: Invoice }[] = [];
+    const working = new Map<string, Invoice>();
     for (const allocation of payment.allocations) {
-      const invoice = this.invoice(allocation.invoiceId);
+      const original = this.invoice(allocation.invoiceId);
+      const invoice = working.get(original.id) ?? original;
       const left = outstanding(invoice);
       const applied = allocation.amount.minor <= left.minor ? allocation.amount : left;
       const excess = allocation.amount.subtract(applied);
       advanceTotal = advanceTotal.add(excess);
-      lines.push({
-        accountId: invoiceAccount,
-        debit: isReceive ? zero : applied,
-        credit: isReceive ? applied : zero,
-        party: invoice.party,
-        reference: invoice.id,
-      });
+      if (applied.isPositive()) {
+        const updated = applyPayment(invoice, applied);
+        working.set(updated.id, updated);
+        plan.push({ invoiceId: updated.id, updated });
+        lines.push({
+          accountId: invoiceAccount,
+          debit: isReceive ? zero : applied,
+          credit: isReceive ? applied : zero,
+          party: invoice.party,
+          reference: invoice.id,
+        });
+      }
     }
 
     if (advanceTotal.isPositive()) {
@@ -240,11 +278,8 @@ export class PaymentBook {
       lines,
     });
 
-    for (const allocation of payment.allocations) {
-      const invoice = this.invoice(allocation.invoiceId);
-      const left = outstanding(invoice);
-      const applied = allocation.amount.minor <= left.minor ? allocation.amount : left;
-      this.invoices.set(invoice.id, applyPayment(invoice, applied));
+    for (const item of plan) {
+      this.invoices.set(item.invoiceId, item.updated);
     }
 
     const posted: PaymentEntry = { ...payment, journalEntryId, postedAt: date };

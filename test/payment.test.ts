@@ -141,12 +141,99 @@ describe("alokasi ke beberapa invoice", () => {
         book.createPayment({
           id: "PAY-031",
           mode: "receive",
-          party: "Customer lain",
+          party: "Party lain",
           amount: idr(100_000),
           allocations: [{ invoiceId: "INV-030", amount: idr(100_000) }],
         }),
       (error: unknown) => error instanceof DomainError && error.code === "invoice_party_mismatch",
     );
+  });
+});
+
+describe("alokasi duplikat ke invoice yang sama", () => {
+  it("menggabungkan dua alokasi untuk satu invoice menjadi satu alokasi", () => {
+    const { invoices, book } = setupBook();
+    addInvoice(invoices, { id: "INV-050", kind: "sales", party: "Customer G", total: idr(1_000_000) });
+
+    const payment = book.createPayment({
+      id: "PAY-050",
+      mode: "receive",
+      party: "Customer G",
+      amount: idr(1_000_000),
+      allocations: [
+        { invoiceId: "INV-050", amount: idr(400_000) },
+        { invoiceId: "INV-050", amount: idr(600_000) },
+      ],
+    });
+
+    assert.equal(payment.allocations.length, 1);
+    assert.equal(payment.allocations[0]?.invoiceId, "INV-050");
+    assert.equal(payment.allocations[0]?.amount.major(), 1_000_000);
+    assert.equal(payment.unallocated.major(), 0);
+  });
+
+  it("tidak mem-post piutang dua kali saat invoice yang sama dialokasikan dua kali", () => {
+    const { ledger, invoices, book } = setupBook();
+    addInvoice(invoices, { id: "INV-051", kind: "sales", party: "Customer H", total: idr(500_000) });
+
+    const payment = book.createPayment({
+      id: "PAY-051",
+      mode: "receive",
+      party: "Customer H",
+      amount: idr(1_000_000),
+      allocations: [
+        { invoiceId: "INV-051", amount: idr(500_000) },
+        { invoiceId: "INV-051", amount: idr(500_000) },
+      ],
+    });
+    const posted = book.postPayment(payment.id, "2026-01-14");
+
+    // Piutang hanya ter-post sebesar sisa tagihan, sisanya jadi uang muka.
+    assert.equal(ledger.balance("AR").credit.major(), 500_000);
+    assert.equal(ledger.balance("Advance").credit.major(), 500_000);
+    assert.equal(ledger.balance("Bank").debit.major(), 1_000_000);
+    assert.equal(book.invoice("INV-051").status, "paid");
+    assert.equal(outstanding(book.invoice("INV-051")).major(), 0);
+    assert.equal(posted.postedAt, "2026-01-14");
+    assert.equal(ledger.allEntries().length, 1);
+  });
+
+  it("tidak meninggalkan jurnal yatim dan bisa di-retry tanpa duplicate journal", () => {
+    const { ledger, invoices, book } = setupBook();
+    addInvoice(invoices, { id: "INV-052", kind: "sales", party: "Customer I", total: idr(500_000) });
+
+    const first = book.createPayment({
+      id: "PAY-052",
+      mode: "receive",
+      party: "Customer I",
+      amount: idr(500_000),
+      allocations: [{ invoiceId: "INV-052", amount: idr(500_000) }],
+    });
+    book.postPayment(first.id, "2026-01-15");
+
+    // Invoice sudah lunas, jadi seluruh pembayaran kedua menjadi uang muka
+    // dan tidak boleh menggagalkan posting setelah jurnal tertulis.
+    const second = book.createPayment({
+      id: "PAY-053",
+      mode: "receive",
+      party: "Customer I",
+      amount: idr(200_000),
+      allocations: [{ invoiceId: "INV-052", amount: idr(200_000) }],
+    });
+    const posted = book.postPayment(second.id, "2026-01-16");
+
+    assert.equal(posted.postedAt, "2026-01-16");
+    assert.equal(ledger.allEntries().length, 2);
+    assert.equal(ledger.balance("AR").credit.major(), 500_000);
+    assert.equal(ledger.balance("Advance").credit.major(), 200_000);
+
+    // Retry setelah posting berhasil ditolak karena entry sudah posting,
+    // bukan karena jurnal ganda.
+    assert.throws(
+      () => book.postPayment(second.id, "2026-01-17"),
+      (error: unknown) => error instanceof DomainError && error.code === "payment_already_posted",
+    );
+    assert.equal(ledger.allEntries().length, 2);
   });
 });
 
