@@ -1,0 +1,19 @@
+{
+  "name": "arahint-erp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pembayaran dan rekonsiliasi untuk arahint-erp",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "test:all": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
