@@ -37,6 +37,11 @@ export interface ReconciliationReport {
 
 export interface ReconciliationOptions {
   currency: string;
+  /**
+   * Akun bank yang direkonsiliasi. Hanya payment entry yang diposting ke
+   * akun ini boleh dicocokkan dengan baris mutasi bank di bawahnya.
+   */
+  bankAccountId: string;
   /** Sumber payment entry, dipakai saat pencocokan. */
   payments?: readonly PaymentEntry[];
   paymentLookup?: (id: string) => PaymentEntry | undefined;
@@ -47,6 +52,7 @@ export interface ReconciliationOptions {
  */
 export class BankReconciliation {
   readonly currency: string;
+  readonly bankAccountId: string;
   private readonly transactions = new Map<string, BankTransaction>();
   private readonly payments: Map<string, PaymentEntry>;
   private readonly lookup: (id: string) => PaymentEntry | undefined;
@@ -54,6 +60,7 @@ export class BankReconciliation {
 
   constructor(options: ReconciliationOptions) {
     this.currency = options.currency;
+    this.bankAccountId = options.bankAccountId;
     this.payments = new Map((options.payments ?? []).map((payment) => [payment.id, payment]));
     this.lookup = options.paymentLookup ?? ((id) => this.payments.get(id));
   }
@@ -81,7 +88,9 @@ export class BankReconciliation {
 
   /**
    * Mencocokkan sebuah payment entry ke baris mutasi bank. Nominal dan mata
-   * uang harus sama, dan tidak ada yang boleh dicocokkan dua kali.
+   * uang harus sama, arah mutasi harus sesuai mode pembayaran, payment harus
+   * sudah posting ke akun bank yang direkonsiliasi, dan tidak ada yang boleh
+   * dicocokkan dua kali.
    */
   match(bankTransactionId: string, paymentId: string, matchedAt: string): ReconciliationMatch {
     const transaction = this.transaction(bankTransactionId);
@@ -101,10 +110,40 @@ export class BankReconciliation {
         `Payment entry ${paymentId} sudah dicocokkan dengan mutasi bank lain`,
       );
     }
+    if (payment.postedAt === undefined || payment.journalEntryId === undefined) {
+      throw new DomainError(
+        "payment_not_posted",
+        `Payment entry ${paymentId} belum posting, tidak bisa direkonsiliasi`,
+      );
+    }
+    if (payment.cashAccountId !== this.bankAccountId) {
+      throw new DomainError(
+        "match_account_mismatch",
+        `Payment entry ${paymentId} diposting ke akun ${payment.cashAccountId}, bukan ${this.bankAccountId}`,
+      );
+    }
     if (payment.currency !== transaction.currency) {
       throw new DomainError(
         "match_currency_mismatch",
         `Mata uang payment ${payment.currency} tidak sama dengan mutasi bank ${transaction.currency}`,
+      );
+    }
+    // Mutasi bank positif berarti uang masuk, jadi harus cocok dengan
+    // pembayaran diterima; mutasi negatif berarti uang keluar, jadi harus
+    // cocok dengan pembayaran yang dibayarkan.
+    const isIncoming = transaction.amount.isPositive();
+    const isOutgoing = transaction.amount.minor < 0;
+    if (transaction.amount.isZero()) {
+      throw new DomainError(
+        "match_direction_mismatch",
+        `Mutasi bank ${bankTransactionId} nol, tidak ada arah yang cocok`,
+      );
+    }
+    const expectedMode = isIncoming ? "receive" : isOutgoing ? "pay" : undefined;
+    if (payment.mode !== expectedMode) {
+      throw new DomainError(
+        "match_direction_mismatch",
+        `Mutasi bank ${bankTransactionId} ${isIncoming ? "masuk" : "keluar"} tidak cocok dengan mode payment ${payment.mode}`,
       );
     }
     if (!payment.amount.equals(transaction.amount.abs())) {

@@ -23,6 +23,9 @@ export type DomainErrorCode =
   | "payment_already_matched"
   | "match_amount_mismatch"
   | "match_currency_mismatch"
+  | "match_account_mismatch"
+  | "match_direction_mismatch"
+  | "payment_not_posted"
   | "duplicate_id";
 
 export class DomainError extends Error {

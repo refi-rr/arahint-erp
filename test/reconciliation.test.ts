@@ -9,7 +9,7 @@ function setup(): { book: ReturnType<typeof setupBook>["book"]; reconciliation: 
   const { book } = setupBook();
   return {
     book,
-    reconciliation: new BankReconciliation({ currency: "IDR", payments: [] }),
+    reconciliation: new BankReconciliation({ currency: "IDR", bankAccountId: "Bank", payments: [] }),
   };
 }
 
@@ -27,7 +27,7 @@ describe("rekonsiliasi bank", () => {
     });
     book.postPayment(payment.id, "2026-02-01");
 
-    const reconciliation = new BankReconciliation({ currency: "IDR", payments: book.allPayments() });
+    const reconciliation = new BankReconciliation({ currency: "IDR", bankAccountId: "Bank", payments: book.allPayments() });
     reconciliation.addTransaction({
       id: "BNK-1",
       date: "2026-02-02",
@@ -60,7 +60,7 @@ describe("rekonsiliasi bank", () => {
     });
     book.postPayment(payment.id, "2026-02-04");
 
-    const reconciliation = new BankReconciliation({ currency: "IDR", payments: book.allPayments() });
+    const reconciliation = new BankReconciliation({ currency: "IDR", bankAccountId: "Bank", payments: book.allPayments() });
     reconciliation.addTransaction({
       id: "BNK-2",
       date: "2026-02-05",
@@ -98,7 +98,7 @@ describe("rekonsiliasi bank", () => {
     });
     book.postPayment(payment.id, "2026-02-07");
 
-    const reconciliation = new BankReconciliation({ currency: "IDR", payments: book.allPayments() });
+    const reconciliation = new BankReconciliation({ currency: "IDR", bankAccountId: "Bank", payments: book.allPayments() });
     reconciliation.addTransaction({
       id: "BNK-4",
       date: "2026-02-08",
@@ -119,6 +119,7 @@ describe("rekonsiliasi bank", () => {
 
     const reconciliation = new BankReconciliation({
       currency: "IDR",
+      bankAccountId: "Bank",
       paymentLookup: (id) => (id === "PAY-140" ? book.payment("PAY-140") : undefined),
     });
 
@@ -156,7 +157,7 @@ describe("rekonsiliasi bank", () => {
     });
     book.postPayment(payment.id, "2026-02-10");
 
-    const reconciliation = new BankReconciliation({ currency: "IDR", payments: book.allPayments() });
+    const reconciliation = new BankReconciliation({ currency: "IDR", bankAccountId: "Bank", payments: book.allPayments() });
     for (const id of ["BNK-5", "BNK-6"]) {
       reconciliation.addTransaction({
         id,
@@ -177,5 +178,130 @@ describe("rekonsiliasi bank", () => {
       () => reconciliation.match("BNK-5", "PAY-130", "2026-02-12"),
       (error: unknown) => error instanceof DomainError && error.code === "transaction_already_matched",
     );
+  });
+
+  it("menolak pembayaran yang diposting ke akun lain", () => {
+    const { invoices, book } = setupBook();
+    addInvoice(invoices, { id: "INV-150", kind: "sales", party: "Customer A", total: idr(500_000) });
+
+    const payment = book.createPayment({
+      id: "PAY-150",
+      mode: "receive",
+      party: "Customer A",
+      amount: idr(500_000),
+      allocations: [{ invoiceId: "INV-150", amount: idr(500_000) }],
+      cashAccountId: "Cash",
+    });
+    book.postPayment(payment.id, "2026-02-16");
+
+    const reconciliation = new BankReconciliation({
+      currency: "IDR",
+      bankAccountId: "Bank",
+      payments: book.allPayments(),
+    });
+    reconciliation.addTransaction({
+      id: "BNK-8",
+      date: "2026-02-17",
+      description: "Kredit transaksi",
+      amount: idr(500_000),
+      currency: "IDR",
+    });
+
+    assert.throws(
+      () => reconciliation.match("BNK-8", "PAY-150", "2026-02-18"),
+      (error: unknown) => error instanceof DomainError && error.code === "match_account_mismatch",
+    );
+    assert.equal(reconciliation.report().unmatched.length, 1);
+  });
+
+  it("menolak payment entry yang belum posting", () => {
+    const { invoices, book } = setupBook();
+    addInvoice(invoices, { id: "INV-160", kind: "sales", party: "Customer A", total: idr(500_000) });
+
+    const payment = book.createPayment({
+      id: "PAY-160",
+      mode: "receive",
+      party: "Customer A",
+      amount: idr(500_000),
+      allocations: [{ invoiceId: "INV-160", amount: idr(500_000) }],
+    });
+
+    const reconciliation = new BankReconciliation({
+      currency: "IDR",
+      bankAccountId: "Bank",
+      payments: book.allPayments(),
+    });
+    reconciliation.addTransaction({
+      id: "BNK-9",
+      date: "2026-02-19",
+      description: "Kredit transaksi",
+      amount: idr(500_000),
+      currency: "IDR",
+    });
+
+    assert.throws(
+      () => reconciliation.match("BNK-9", "PAY-160", "2026-02-20"),
+      (error: unknown) => error instanceof DomainError && error.code === "payment_not_posted",
+    );
+    assert.equal(reconciliation.report().unmatched.length, 1);
+  });
+
+  it("menolak mutasi bank yang berlawanan arah dengan mode pembayaran", () => {
+    const { invoices, book } = setupBook();
+    addInvoice(invoices, { id: "INV-170", kind: "sales", party: "Customer A", total: idr(500_000) });
+    addInvoice(invoices, { id: "BILL-170", kind: "purchase", party: "Supplier A", total: idr(500_000) });
+
+    const receive = book.createPayment({
+      id: "PAY-170",
+      mode: "receive",
+      party: "Customer A",
+      amount: idr(500_000),
+      allocations: [{ invoiceId: "INV-170", amount: idr(500_000) }],
+    });
+    book.postPayment(receive.id, "2026-02-21");
+    const pay = book.createPayment({
+      id: "PAY-171",
+      mode: "pay",
+      party: "Supplier A",
+      amount: idr(500_000),
+      allocations: [{ invoiceId: "BILL-170", amount: idr(500_000) }],
+    });
+    book.postPayment(pay.id, "2026-02-21");
+
+    const reconciliation = new BankReconciliation({
+      currency: "IDR",
+      bankAccountId: "Bank",
+      payments: book.allPayments(),
+    });
+    reconciliation.addTransaction({
+      id: "BNK-10",
+      date: "2026-02-22",
+      description: "Debet transaksi",
+      amount: idr(-500_000),
+      currency: "IDR",
+    });
+    reconciliation.addTransaction({
+      id: "BNK-11",
+      date: "2026-02-22",
+      description: "Kredit transaksi",
+      amount: idr(500_000),
+      currency: "IDR",
+    });
+
+    // Mutasi negatif (uang keluar) tidak boleh dicocokkan dengan pembayaran diterima.
+    assert.throws(
+      () => reconciliation.match("BNK-10", "PAY-170", "2026-02-23"),
+      (error: unknown) => error instanceof DomainError && error.code === "match_direction_mismatch",
+    );
+    // Mutasi positif (uang masuk) tidak boleh dicocokkan dengan pembayaran yang dibayarkan.
+    assert.throws(
+      () => reconciliation.match("BNK-11", "PAY-171", "2026-02-23"),
+      (error: unknown) => error instanceof DomainError && error.code === "match_direction_mismatch",
+    );
+
+    // Arah yang sesuai tetap bisa dicocokkan.
+    reconciliation.match("BNK-11", "PAY-170", "2026-02-23");
+    reconciliation.match("BNK-10", "PAY-171", "2026-02-23");
+    assert.equal(reconciliation.report().unmatched.length, 0);
   });
 });
