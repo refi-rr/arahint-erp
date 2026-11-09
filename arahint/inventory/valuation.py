@@ -122,6 +122,10 @@ class MovingAverageValuation:
         """The value of ``base_qty`` at the balance's current average cost."""
         if state.qty <= 0:
             raise ValidationError("cannot value outgoing stock from an empty balance")
+        if base_qty > state.qty:
+            raise ValidationError(
+                "cannot value outgoing stock beyond the available balance"
+            )
         if base_qty == state.qty:
             return quantize_money(state.value)
         value = quantize_money(base_qty * (state.value / state.qty))

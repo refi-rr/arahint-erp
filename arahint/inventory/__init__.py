@@ -19,8 +19,10 @@ from .valuation import (
     MOVING_AVERAGE,
     VALUATION_METHODS,
     FifoValuation,
+    Movement,
     MovingAverageValuation,
     ValuationRegistry,
+    ValuationResult,
     ValuationState,
 )
 
@@ -31,6 +33,7 @@ __all__ = [
     "InventoryError",
     "InventoryService",
     "MOVING_AVERAGE",
+    "Movement",
     "MovingAverageValuation",
     "NotFoundError",
     "UomConversion",
@@ -38,5 +41,6 @@ __all__ = [
     "VALUATION_METHODS",
     "ValidationError",
     "ValuationRegistry",
+    "ValuationResult",
     "ValuationState",
 ]

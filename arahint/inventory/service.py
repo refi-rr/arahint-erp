@@ -272,7 +272,14 @@ class InventoryService:
         )
 
         line_id = self._insert_entry_line(
-            entry_id, line_no, item["id"], None, warehouse["id"], conversion, base_rate
+            entry_id,
+            line_no,
+            item["id"],
+            None,
+            warehouse["id"],
+            conversion,
+            txn_rate=rate,
+            base_rate=base_rate,
         )
         self._insert_ledger(
             entry_id,
@@ -317,7 +324,13 @@ class InventoryService:
         value = quantize_money(abs(result.movement_value))
 
         line_id = self._insert_entry_line(
-            entry_id, line_no, item["id"], warehouse["id"], None, conversion, None
+            entry_id,
+            line_no,
+            item["id"],
+            warehouse["id"],
+            None,
+            conversion,
+            base_rate=result.rate,
         )
         self._insert_ledger(
             entry_id,
@@ -376,7 +389,13 @@ class InventoryService:
         )
 
         line_id = self._insert_entry_line(
-            entry_id, line_no, item["id"], source["id"], target["id"], conversion, None
+            entry_id,
+            line_no,
+            item["id"],
+            source["id"],
+            target["id"],
+            conversion,
+            base_rate=source_result.rate,
         )
         self._insert_ledger(
             entry_id,
@@ -525,6 +544,84 @@ class InventoryService:
                 }
             )
         return rows
+
+    def stock_entries(
+        self,
+        company: str | None = None,
+        entry_type: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> list[dict]:
+        """The stock entries, each with its lines in both UOMs."""
+        sql = (
+            "SELECT e.id, e.entry_type, e.posting_date, e.reference, "
+            "c.code AS company_code FROM stock_entries e "
+            "JOIN companies c ON c.id = e.company_id WHERE 1 = 1"
+        )
+        params: list = []
+        if company:
+            sql += " AND c.code = ?"
+            params.append(_text(company, "company"))
+        if entry_type:
+            sql += " AND e.entry_type = ?"
+            params.append(_text(entry_type, "entry_type"))
+        if from_date:
+            sql += " AND e.posting_date >= ?"
+            params.append(_require_date(from_date, "from_date"))
+        if to_date:
+            sql += " AND e.posting_date <= ?"
+            params.append(_require_date(to_date, "to_date"))
+        sql += " ORDER BY e.posting_date, e.id"
+
+        entries = []
+        for row in self.conn.execute(sql, params):
+            entries.append(
+                {
+                    "id": row["id"],
+                    "entry_type": row["entry_type"],
+                    "posting_date": row["posting_date"],
+                    "reference": row["reference"],
+                    "company_code": row["company_code"],
+                    "lines": self.entry_lines(row["id"]),
+                }
+            )
+        return entries
+
+    def entry_lines(self, entry_id: int) -> list[dict]:
+        """The lines of a stock entry, showing the transaction and base quantity."""
+        sql = (
+            "SELECT l.id, l.line_no, l.qty, l.rate, l.base_qty, l.base_rate, "
+            "l.source_warehouse_id, l.target_warehouse_id, "
+            "i.code AS item_code, u.code AS uom_code, "
+            "su.code AS source_warehouse_code, tu.code AS target_warehouse_code "
+            "FROM stock_entry_lines l "
+            "JOIN items i ON i.id = l.item_id "
+            "JOIN uoms u ON u.id = l.uom_id "
+            "LEFT JOIN warehouses su ON su.id = l.source_warehouse_id "
+            "LEFT JOIN warehouses tu ON tu.id = l.target_warehouse_id "
+            "WHERE l.entry_id = ? ORDER BY l.line_no"
+        )
+        lines = []
+        for row in self.conn.execute(sql, (entry_id,)):
+            lines.append(
+                {
+                    "id": row["id"],
+                    "line_no": row["line_no"],
+                    "item_code": row["item_code"],
+                    "uom_code": row["uom_code"],
+                    "qty": quantize_qty(row["qty"]),
+                    "rate": quantize_rate(row["rate"]) if row["rate"] is not None else None,
+                    "base_qty": quantize_qty(row["base_qty"]),
+                    "base_rate": (
+                        quantize_rate(row["base_rate"])
+                        if row["base_rate"] is not None
+                        else None
+                    ),
+                    "source_warehouse_code": row["source_warehouse_code"],
+                    "target_warehouse_code": row["target_warehouse_code"],
+                }
+            )
+        return lines
 
     def valuation_report(
         self, as_of: str | None = None, company: str | None = None
@@ -790,14 +887,28 @@ class InventoryService:
             )
 
     def _insert_entry_line(
-        self, entry_id, line_no, item_id, source_id, target_id, conversion, rate
+        self,
+        entry_id,
+        line_no,
+        item_id,
+        source_id,
+        target_id,
+        conversion,
+        txn_rate=None,
+        base_rate=None,
     ) -> int:
-        """Store the line in the transaction UOM alongside its base quantity."""
+        """Store the line in the transaction UOM alongside its base quantity.
+
+        ``qty`` is the quantity in the transaction UOM and ``rate`` the price
+        per that UOM, so ``qty * rate`` is the value of the line. ``base_qty``
+        is the converted quantity and ``base_rate`` the price per base unit
+        that keeps the same value.
+        """
         return self.conn.execute(
             "INSERT INTO stock_entry_lines "
             "(entry_id, line_no, item_id, source_warehouse_id, target_warehouse_id, "
-            "qty, uom_id, rate, base_qty) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "qty, uom_id, rate, base_qty, base_rate) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 entry_id,
                 line_no,
@@ -806,8 +917,9 @@ class InventoryService:
                 target_id,
                 str(quantize_qty(conversion.txn_qty)),
                 conversion.uom_id,
-                str(quantize_rate(rate)) if rate is not None else None,
+                str(quantize_rate(txn_rate)) if txn_rate is not None else None,
                 str(conversion.base_qty),
+                str(quantize_rate(base_rate)) if base_rate is not None else None,
             ),
         ).lastrowid
 

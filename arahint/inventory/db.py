@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS stock_entry_lines (
     uom_id INTEGER NOT NULL REFERENCES uoms(id),
     rate TEXT,
     base_qty TEXT NOT NULL DEFAULT '0',
+    base_rate TEXT,
     UNIQUE (entry_id, line_no)
 );
 
@@ -122,9 +123,26 @@ CREATE INDEX IF NOT EXISTS idx_journal_lines_journal
 """
 
 
+def _add_missing_columns(connection: sqlite3.Connection) -> None:
+    """Bring a database created by an earlier version up to date.
+
+    The schema is created with ``IF NOT EXISTS``, so a database that already
+    exists keeps its old columns. Adding a column is the only change so far,
+    and SQLite has no ``ADD COLUMN IF NOT EXISTS``.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(stock_entry_lines)")
+    }
+    if "base_rate" not in columns:
+        connection.execute("ALTER TABLE stock_entry_lines ADD COLUMN base_rate TEXT")
+
+
 def connect(path: str = ":memory:") -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.executescript(SCHEMA)
+    _add_missing_columns(connection)
+    connection.commit()
     return connection

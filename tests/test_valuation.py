@@ -61,13 +61,22 @@ class FifoValuationTest(unittest.TestCase):
     def setUp(self):
         self.conn = connect(":memory:")
         self.valuation = FifoValuation(self.conn)
+        self.conn.execute(
+            "INSERT INTO companies (id, code, name, currency) VALUES (1, 'AC', 'AC', 'IDR')"
+        )
         self.conn.execute("INSERT INTO uoms (id, code, name) VALUES (1, 'PCS', 'Piece')")
         self.conn.execute(
             "INSERT INTO items (id, code, name, base_uom_id, valuation_method) "
             "VALUES (1, 'ITEM', 'Item', 1, 'fifo')"
         )
         self.item = self.conn.execute("SELECT * FROM items WHERE id = 1").fetchone()
-        self.conn.execute("INSERT INTO warehouses (id, code, name, company_id) VALUES (1, 'WH1', 'WH1', 1)")
+        self.conn.execute(
+            "INSERT INTO warehouses (id, code, name, company_id) VALUES (1, 'WH1', 'WH1', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO stock_entries (id, entry_type, posting_date, company_id, created_at) "
+            "VALUES (1, 'receipt', '2026-01-01', 1, '2026-01-01')"
+        )
 
     def tearDown(self):
         self.conn.close()
@@ -118,11 +127,9 @@ class ValuationRegistryTest(unittest.TestCase):
         self.assertEqual(self.registry.for_item(item).method, FIFO)
 
     def test_registry_rejects_an_unknown_method(self):
-        self.conn.execute(
-            "INSERT INTO items (id, code, name, base_uom_id, valuation_method) "
-            "VALUES (3, 'XX', 'Unknown', 1, 'weighted_average')"
-        )
-        item = self.conn.execute("SELECT * FROM items WHERE id = 3").fetchone()
+        # The schema forbids other methods, so the registry is checked against a
+        # row that carries one anyway.
+        item = {"id": 3, "valuation_method": "weighted_average"}
         with self.assertRaises(ValidationError):
             self.registry.for_item(item)
 
