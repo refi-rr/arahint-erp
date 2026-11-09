@@ -1,54 +1,38 @@
-"""Inventory core: items, warehouses, stock ledger, valuation, and journals."""
+"""Inventory core: items, warehouses, stock ledger, valuation, and journals.
+
+The service owns the inventory workflow. It converts transactions into the
+item's base UOM through the UOM converter, values every movement through the
+valuation registry, and writes the result to an append-only stock ledger that
+the reports read back.
+"""
 
 from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
-from typing import NamedTuple
+from decimal import Decimal
 
-QTY_QUANT = Decimal("0.000001")
-MONEY_QUANT = Decimal("0.01")
-RATE_QUANT = Decimal("0.000001")
+from .errors import (
+    DuplicateError,
+    NotFoundError,
+    ValidationError,
+)
+from .numeric import (
+    quantize_money,
+    quantize_qty,
+    quantize_rate,
+    to_decimal,
+)
+from .uom import UomConverter
+from .valuation import (
+    MOVING_AVERAGE,
+    VALUATION_METHODS,
+    Movement,
+    ValuationRegistry,
+    ValuationState,
+)
 
-VALUATION_METHODS = ("fifo", "moving_average")
 ENTRY_TYPES = ("receipt", "issue", "transfer")
-
-
-class InventoryError(Exception):
-    """Base class for inventory domain errors."""
-
-
-class ValidationError(InventoryError):
-    """The submitted data violates a domain rule."""
-
-
-class NotFoundError(InventoryError):
-    """A referenced record does not exist."""
-
-
-class DuplicateError(InventoryError):
-    """A record with the same natural key already exists."""
-
-
-def _decimal(value) -> Decimal:
-    if isinstance(value, Decimal):
-        return value
-    if value is None:
-        return Decimal("0")
-    return Decimal(str(value))
-
-
-def _qty(value) -> Decimal:
-    return _decimal(value).quantize(QTY_QUANT, rounding=ROUND_HALF_UP)
-
-
-def _money(value) -> Decimal:
-    return _decimal(value).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
-
-
-def _rate(value) -> Decimal:
-    return _decimal(value).quantize(RATE_QUANT, rounding=ROUND_HALF_UP)
 
 
 def _text(value, field: str) -> str:
@@ -68,11 +52,6 @@ def _now() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat()
 
 
-class StockState(NamedTuple):
-    qty: Decimal
-    value: Decimal
-
-
 class InventoryService:
     """Transactional inventory operations backed by a SQLite connection."""
 
@@ -87,6 +66,8 @@ class InventoryService:
         self.inventory_account = inventory_account
         self.cogs_account = cogs_account
         self.inventory_input_account = inventory_input_account
+        self.uom = UomConverter(connection)
+        self.valuations = ValuationRegistry(connection)
 
     def close(self) -> None:
         self.conn.close()
@@ -112,7 +93,7 @@ class InventoryService:
         code: str,
         name: str,
         base_uom: str,
-        valuation_method: str = "moving_average",
+        valuation_method: str = MOVING_AVERAGE,
     ) -> int:
         if valuation_method not in VALUATION_METHODS:
             raise ValidationError(
@@ -130,7 +111,7 @@ class InventoryService:
         uom_row = self._get_uom(uom)
         if uom_row["id"] == item_row["base_uom_id"]:
             raise ValidationError("base UOM does not need a conversion factor")
-        factor_value = _decimal(factor)
+        factor_value = to_decimal(factor)
         if factor_value <= 0:
             raise ValidationError("conversion factor must be greater than zero")
         return self._insert(
@@ -146,6 +127,70 @@ class InventoryService:
             (_text(code, "code"), _text(name or code, "name"), company_row["id"]),
             f"warehouse {code!r} for company {company!r}",
         )
+
+    # -------------------------------------------------------------- master reads
+
+    def get_item(self, code: str) -> dict:
+        """An item with its base UOM and the other UOMs it offers."""
+        item = self._get_item(code)
+        uom = self.conn.execute(
+            "SELECT code, name FROM uoms WHERE id = ?", (item["base_uom_id"],)
+        ).fetchone()
+        conversions = [
+            {
+                "uom_code": row["code"],
+                "uom_name": row["name"],
+                "factor": to_decimal(row["factor"]),
+            }
+            for row in self.conn.execute(
+                "SELECT u.code, u.name, c.factor FROM item_uom_conversions c "
+                "JOIN uoms u ON u.id = c.uom_id WHERE c.item_id = ? ORDER BY u.code",
+                (item["id"],),
+            )
+        ]
+        return {
+            "code": item["code"],
+            "name": item["name"],
+            "base_uom": uom["code"],
+            "base_uom_name": uom["name"],
+            "valuation_method": item["valuation_method"],
+            "uoms": conversions,
+        }
+
+    def list_items(self) -> list[dict]:
+        """Every item with its base UOM and conversion factors."""
+        return [self.get_item(row["code"]) for row in
+                self.conn.execute("SELECT code FROM items ORDER BY code")]
+
+    def list_uoms(self) -> list[dict]:
+        return [
+            {"code": row["code"], "name": row["name"]}
+            for row in self.conn.execute("SELECT code, name FROM uoms ORDER BY code")
+        ]
+
+    def list_warehouses(self, company: str) -> list[dict]:
+        company_row = self._get_company(company)
+        return [
+            {"code": row["code"], "name": row["name"]}
+            for row in self.conn.execute(
+                "SELECT code, name FROM warehouses WHERE company_id = ? ORDER BY code",
+                (company_row["id"],),
+            )
+        ]
+
+    def convert_to_base(self, item: str, uom: str, quantity) -> dict:
+        """Convert a quantity in ``uom`` into the item's base UOM."""
+        item_row = self._get_item(item)
+        uom_row = self._get_uom(uom)
+        conversion = self.uom.convert(item_row, uom_row["id"], quantity)
+        return {
+            "item_code": item_row["code"],
+            "uom_code": uom_row["code"],
+            "base_uom_code": self._base_uom_code(item_row),
+            "quantity": conversion.txn_qty,
+            "factor": conversion.factor,
+            "base_quantity": conversion.base_qty,
+        }
 
     # -------------------------------------------------------------- stock posting
 
@@ -204,25 +249,30 @@ class InventoryService:
         item = self._get_item(line.get("item"))
         warehouse = self._get_warehouse(company_row["id"], line.get("target_warehouse"))
         uom = self._get_uom(line.get("uom"))
-        quantity = _decimal(line.get("qty"))
         if "rate" not in line or line["rate"] is None:
             raise ValidationError("receipt needs a rate")
-        rate = _decimal(line["rate"])
-        if quantity <= 0:
-            raise ValidationError("receipt quantity must be greater than zero")
+        rate = to_decimal(line["rate"])
         if rate < 0:
             raise ValidationError("receipt rate cannot be negative")
 
-        base_qty = self._to_base_qty(item, quantity, uom["id"])
-        value = _money(quantity * rate)
+        conversion = self.uom.convert(item, uom["id"], line.get("qty"))
+        if conversion.txn_qty <= 0:
+            raise ValidationError("receipt quantity must be greater than zero")
+
+        # The rate is given per transaction UOM, so the money value is known
+        # before conversion and is preserved by it.
+        value = quantize_money(conversion.txn_qty * rate)
+        base_rate = self.uom.base_rate(value, conversion.base_qty)
+
         self._assert_chronological(item["id"], warehouse["id"], posting)
         state = self._state(item["id"], warehouse["id"])
-        new_qty = _qty(state.qty + base_qty)
-        new_value = _money(state.value + value)
-        effective_rate = _rate(value / base_qty) if base_qty else Decimal("0")
+        movement = Movement(item, warehouse["id"], entry_id, posting)
+        result = self.valuations.for_item(item).receipt(
+            movement, state, conversion.base_qty, value
+        )
 
         line_id = self._insert_entry_line(
-            entry_id, line_no, item["id"], None, warehouse["id"], quantity, uom["id"], rate
+            entry_id, line_no, item["id"], None, warehouse["id"], conversion, base_rate
         )
         self._insert_ledger(
             entry_id,
@@ -230,14 +280,12 @@ class InventoryService:
             item["id"],
             warehouse["id"],
             posting,
-            base_qty,
-            effective_rate,
+            conversion.base_qty,
+            base_rate,
             value,
-            new_qty,
-            new_value,
+            result.qty,
+            result.value,
         )
-        if item["valuation_method"] == "fifo":
-            self._add_layer(item["id"], warehouse["id"], entry_id, posting, base_qty, value, effective_rate)
 
         journal_lines.append(
             (self.inventory_account, value, Decimal("0"), item["id"], warehouse["id"])
@@ -252,26 +300,24 @@ class InventoryService:
         item = self._get_item(line.get("item"))
         warehouse = self._get_warehouse(company_row["id"], line.get("source_warehouse"))
         uom = self._get_uom(line.get("uom"))
-        quantity = _decimal(line.get("qty"))
-        if quantity <= 0:
+
+        conversion = self.uom.convert(item, uom["id"], line.get("qty"))
+        if conversion.txn_qty <= 0:
             raise ValidationError("issue quantity must be greater than zero")
 
-        base_qty = self._to_base_qty(item, quantity, uom["id"])
         self._assert_chronological(item["id"], warehouse["id"], posting)
         state = self._state(item["id"], warehouse["id"])
-        if base_qty > state.qty:
+        if conversion.base_qty > state.qty:
             raise ValidationError(
                 f"insufficient stock for item {item['code']!r} in warehouse {warehouse['code']!r}"
             )
-        value = self._outgoing_value(item, warehouse["id"], base_qty, state)
-        new_qty = _qty(state.qty - base_qty)
-        new_value = _money(state.value - value)
-        if new_qty == 0:
-            new_value = Decimal("0.00")
-        effective_rate = _rate(value / base_qty)
+
+        movement = Movement(item, warehouse["id"], entry_id, posting)
+        result = self.valuations.for_item(item).issue(movement, state, conversion.base_qty)
+        value = quantize_money(abs(result.movement_value))
 
         line_id = self._insert_entry_line(
-            entry_id, line_no, item["id"], warehouse["id"], None, quantity, uom["id"], None
+            entry_id, line_no, item["id"], warehouse["id"], None, conversion, None
         )
         self._insert_ledger(
             entry_id,
@@ -279,12 +325,13 @@ class InventoryService:
             item["id"],
             warehouse["id"],
             posting,
-            -base_qty,
-            effective_rate,
+            -conversion.base_qty,
+            result.rate,
             -value,
-            new_qty,
-            new_value,
+            result.qty,
+            result.value,
         )
+
         journal_lines.append(
             (self.cogs_account, value, Decimal("0"), item["id"], warehouse["id"])
         )
@@ -299,38 +346,37 @@ class InventoryService:
         source = self._get_warehouse(company_row["id"], line.get("source_warehouse"))
         target = self._get_warehouse(company_row["id"], line.get("target_warehouse"))
         uom = self._get_uom(line.get("uom"))
-        quantity = _decimal(line.get("qty"))
-        if quantity <= 0:
+
+        conversion = self.uom.convert(item, uom["id"], line.get("qty"))
+        if conversion.txn_qty <= 0:
             raise ValidationError("transfer quantity must be greater than zero")
         if source["id"] == target["id"]:
             raise ValidationError("transfer source and target warehouses must differ")
 
-        base_qty = self._to_base_qty(item, quantity, uom["id"])
         self._assert_chronological(item["id"], source["id"], posting)
         self._assert_chronological(item["id"], target["id"], posting)
         source_state = self._state(item["id"], source["id"])
-        if base_qty > source_state.qty:
+        if conversion.base_qty > source_state.qty:
             raise ValidationError(
                 f"insufficient stock for item {item['code']!r} in warehouse {source['code']!r}"
             )
         target_state = self._state(item["id"], target["id"])
 
-        value = self._outgoing_value(item, source["id"], base_qty, source_state)
-        out_qty = _qty(source_state.qty - base_qty)
-        out_value = _money(source_state.value - value)
-        if out_qty == 0:
-            out_value = Decimal("0.00")
-        effective_rate = _rate(value / base_qty)
+        # The value leaving the source is the value arriving at the target, so
+        # a transfer never changes the total stock value of the company.
+        source_movement = Movement(item, source["id"], entry_id, posting)
+        source_result = self.valuations.for_item(item).issue(
+            source_movement, source_state, conversion.base_qty
+        )
+        value = quantize_money(abs(source_result.movement_value))
+
+        target_movement = Movement(item, target["id"], entry_id, posting)
+        target_result = self.valuations.for_item(item).receipt(
+            target_movement, target_state, conversion.base_qty, value
+        )
 
         line_id = self._insert_entry_line(
-            entry_id,
-            line_no,
-            item["id"],
-            source["id"],
-            target["id"],
-            quantity,
-            uom["id"],
-            None,
+            entry_id, line_no, item["id"], source["id"], target["id"], conversion, None
         )
         self._insert_ledger(
             entry_id,
@@ -338,92 +384,30 @@ class InventoryService:
             item["id"],
             source["id"],
             posting,
-            -base_qty,
-            effective_rate,
+            -conversion.base_qty,
+            source_result.rate,
             -value,
-            out_qty,
-            out_value,
+            source_result.qty,
+            source_result.value,
         )
-        in_qty = _qty(target_state.qty + base_qty)
-        in_value = _money(target_state.value + value)
         self._insert_ledger(
             entry_id,
             line_id,
             item["id"],
             target["id"],
             posting,
-            base_qty,
-            effective_rate,
+            conversion.base_qty,
+            target_result.rate,
             value,
-            in_qty,
-            in_value,
+            target_result.qty,
+            target_result.value,
         )
-        if item["valuation_method"] == "fifo":
-            self._add_layer(
-                item["id"], target["id"], entry_id, posting, base_qty, value, effective_rate
-            )
 
         journal_lines.append(
             (self.inventory_account, value, Decimal("0"), item["id"], target["id"])
         )
         journal_lines.append(
             (self.inventory_account, Decimal("0"), value, item["id"], source["id"])
-        )
-
-    # ------------------------------------------------------------------ valuation
-
-    def _outgoing_value(self, item, warehouse_id, base_qty: Decimal, state) -> Decimal:
-        if item["valuation_method"] == "fifo":
-            value = self._consume_fifo(item["id"], warehouse_id, base_qty)
-        elif base_qty == state.qty:
-            value = state.value
-        else:
-            value = _money(base_qty * (state.value / state.qty))
-        value = _money(value)
-        if value > state.value:
-            value = state.value
-        return value
-
-    def _consume_fifo(self, item_id, warehouse_id, base_qty: Decimal) -> Decimal:
-        remaining = base_qty
-        total = Decimal("0")
-        rows = self.conn.execute(
-            "SELECT id, qty_remaining, value_remaining FROM stock_layers "
-            "WHERE item_id = ? AND warehouse_id = ? ORDER BY id",
-            (item_id, warehouse_id),
-        ).fetchall()
-        for row in rows:
-            if remaining <= 0:
-                break
-            layer_qty = _decimal(row["qty_remaining"])
-            layer_value = _decimal(row["value_remaining"])
-            if layer_qty <= 0:
-                continue
-            take = min(layer_qty, remaining)
-            if take == layer_qty:
-                take_value = layer_value
-            else:
-                take_value = _money(layer_value * take / layer_qty)
-            new_qty = _qty(layer_qty - take)
-            new_value = layer_value - take_value
-            if new_qty == 0:
-                new_value = Decimal("0.00")
-            self.conn.execute(
-                "UPDATE stock_layers SET qty_remaining = ?, value_remaining = ? WHERE id = ?",
-                (str(new_qty), str(_money(new_value)), row["id"]),
-            )
-            total += take_value
-            remaining -= take
-        if remaining > 0:
-            raise ValidationError("stock layers do not cover the requested quantity")
-        return total
-
-    def _add_layer(self, item_id, warehouse_id, entry_id, posted_at, qty, value, rate) -> None:
-        self.conn.execute(
-            "INSERT INTO stock_layers "
-            "(item_id, warehouse_id, entry_id, received_at, qty_remaining, value_remaining, rate) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (item_id, warehouse_id, entry_id, posted_at, str(qty), str(_money(value)), str(rate)),
         )
 
     # -------------------------------------------------------------------- reports
@@ -470,15 +454,15 @@ class InventoryService:
                     "value": Decimal("0"),
                 },
             )
-            bucket["qty"] += _decimal(row["qty_change"])
-            bucket["value"] += _decimal(row["stock_value_change"])
+            bucket["qty"] += to_decimal(row["qty_change"])
+            bucket["value"] += to_decimal(row["stock_value_change"])
 
         result = []
         for bucket in aggregates.values():
-            bucket["qty"] = _qty(bucket["qty"])
-            bucket["value"] = _money(bucket["value"])
+            bucket["qty"] = quantize_qty(bucket["qty"])
+            bucket["value"] = quantize_money(bucket["value"])
             bucket["rate"] = (
-                _rate(bucket["value"] / bucket["qty"]) if bucket["qty"] else Decimal("0.000000")
+                quantize_rate(bucket["value"] / bucket["qty"]) if bucket["qty"] else Decimal("0.000000")
             )
             if not include_zero and bucket["qty"] == 0 and bucket["value"] == 0:
                 continue
@@ -533,11 +517,11 @@ class InventoryService:
                     "item_code": row["item_code"],
                     "warehouse_code": row["warehouse_code"],
                     "company_code": row["company_code"],
-                    "qty_change": _qty(row["qty_change"]),
-                    "valuation_rate": _rate(row["valuation_rate"]),
-                    "stock_value_change": _money(row["stock_value_change"]),
-                    "qty_after": _qty(row["qty_after"]),
-                    "stock_value_after": _money(row["stock_value_after"]),
+                    "qty_change": quantize_qty(row["qty_change"]),
+                    "valuation_rate": quantize_rate(row["valuation_rate"]),
+                    "stock_value_change": quantize_money(row["stock_value_change"]),
+                    "qty_after": quantize_qty(row["qty_after"]),
+                    "stock_value_after": quantize_money(row["stock_value_after"]),
                 }
             )
         return rows
@@ -563,15 +547,15 @@ class InventoryService:
         result = []
         total_value = Decimal("0.00")
         for bucket in items.values():
-            bucket["qty"] = _qty(bucket["qty"])
-            bucket["value"] = _money(bucket["value"])
+            bucket["qty"] = quantize_qty(bucket["qty"])
+            bucket["value"] = quantize_money(bucket["value"])
             bucket["rate"] = (
-                _rate(bucket["value"] / bucket["qty"]) if bucket["qty"] else Decimal("0.000000")
+                quantize_rate(bucket["value"] / bucket["qty"]) if bucket["qty"] else Decimal("0.000000")
             )
             total_value += bucket["value"]
             result.append(bucket)
         result.sort(key=lambda row: row["item_code"])
-        return {"items": result, "total_value": _money(total_value)}
+        return {"items": result, "total_value": quantize_money(total_value)}
 
     def outgoing_valuation(
         self,
@@ -614,8 +598,8 @@ class InventoryService:
                     "value": Decimal("0"),
                 },
             )
-            quantity = abs(_decimal(row["qty_change"]))
-            value = abs(_decimal(row["stock_value_change"]))
+            quantity = abs(to_decimal(row["qty_change"]))
+            value = abs(to_decimal(row["stock_value_change"]))
             bucket["qty"] += quantity
             bucket["value"] += value
             total_qty += quantity
@@ -623,17 +607,17 @@ class InventoryService:
 
         result = []
         for bucket in items.values():
-            bucket["qty"] = _qty(bucket["qty"])
-            bucket["value"] = _money(bucket["value"])
+            bucket["qty"] = quantize_qty(bucket["qty"])
+            bucket["value"] = quantize_money(bucket["value"])
             bucket["rate"] = (
-                _rate(bucket["value"] / bucket["qty"]) if bucket["qty"] else Decimal("0.000000")
+                quantize_rate(bucket["value"] / bucket["qty"]) if bucket["qty"] else Decimal("0.000000")
             )
             result.append(bucket)
         result.sort(key=lambda row: row["item_code"])
         return {
             "items": result,
-            "total_qty": _qty(total_qty),
-            "total_value": _money(total_value),
+            "total_qty": quantize_qty(total_qty),
+            "total_value": quantize_money(total_value),
         }
 
     def journal_entries(
@@ -677,8 +661,8 @@ class InventoryService:
                 lines.append(
                     {
                         "account": line["account"],
-                        "debit": _money(line["debit"]),
-                        "credit": _money(line["credit"]),
+                        "debit": quantize_money(line["debit"]),
+                        "credit": quantize_money(line["credit"]),
                         "item_code": line["item_code"],
                         "warehouse_code": line["warehouse_code"],
                     }
@@ -714,8 +698,8 @@ class InventoryService:
         result = []
         for account in sorted(accounts):
             bucket = accounts[account]
-            bucket["debit"] = _money(bucket["debit"])
-            bucket["credit"] = _money(bucket["credit"])
+            bucket["debit"] = quantize_money(bucket["debit"])
+            bucket["credit"] = quantize_money(bucket["credit"])
             result.append(bucket)
         return result
 
@@ -728,10 +712,10 @@ class InventoryService:
         outgoing = self.outgoing_valuation(from_date, to_date, company)
         journal = {row["account"]: row for row in self.journal_report(from_date, to_date, company)}
         journal_cogs = journal.get(self.cogs_account, {}).get("debit", Decimal("0.00"))
-        difference = _money(outgoing["total_value"] - journal_cogs)
+        difference = quantize_money(outgoing["total_value"] - journal_cogs)
         return {
             "outgoing_value": outgoing["total_value"],
-            "journal_cogs": _money(journal_cogs),
+            "journal_cogs": quantize_money(journal_cogs),
             "difference": difference,
             "balanced": difference == 0,
         }
@@ -754,6 +738,12 @@ class InventoryService:
     def _get_item(self, code) -> sqlite3.Row:
         return self._get_one("SELECT * FROM items WHERE code = ?", code, "item")
 
+    def _base_uom_code(self, item: sqlite3.Row) -> str:
+        row = self.conn.execute(
+            "SELECT code FROM uoms WHERE id = ?", (item["base_uom_id"],)
+        ).fetchone()
+        return row["code"]
+
     def _get_warehouse(self, company_id: int, code) -> sqlite3.Row:
         if not isinstance(code, str) or not code.strip():
             raise ValidationError("warehouse code is required")
@@ -773,22 +763,7 @@ class InventoryService:
             raise NotFoundError(f"{label} {code!r} not found")
         return row
 
-    def _to_base_qty(self, item, quantity: Decimal, uom_id: int) -> Decimal:
-        if uom_id == item["base_uom_id"]:
-            factor = Decimal("1")
-        else:
-            row = self.conn.execute(
-                "SELECT factor FROM item_uom_conversions WHERE item_id = ? AND uom_id = ?",
-                (item["id"], uom_id),
-            ).fetchone()
-            if row is None:
-                raise ValidationError(
-                    f"no conversion from this UOM to the base UOM of item {item['code']!r}"
-                )
-            factor = _decimal(row["factor"])
-        return _qty(quantity * factor)
-
-    def _state(self, item_id: int, warehouse_id: int) -> StockState:
+    def _state(self, item_id: int, warehouse_id: int) -> ValuationState:
         row = self.conn.execute(
             "SELECT qty_after, stock_value_after FROM stock_ledger "
             "WHERE item_id = ? AND warehouse_id = ? "
@@ -796,8 +771,10 @@ class InventoryService:
             (item_id, warehouse_id),
         ).fetchone()
         if row is None:
-            return StockState(Decimal("0"), Decimal("0.00"))
-        return StockState(_decimal(row["qty_after"]), _decimal(row["stock_value_after"]))
+            return ValuationState(Decimal("0"), Decimal("0.00"))
+        return ValuationState(
+            to_decimal(row["qty_after"]), to_decimal(row["stock_value_after"])
+        )
 
     def _assert_chronological(self, item_id: int, warehouse_id: int, posting: str) -> None:
         row = self.conn.execute(
@@ -813,21 +790,24 @@ class InventoryService:
             )
 
     def _insert_entry_line(
-        self, entry_id, line_no, item_id, source_id, target_id, qty, uom_id, rate
+        self, entry_id, line_no, item_id, source_id, target_id, conversion, rate
     ) -> int:
+        """Store the line in the transaction UOM alongside its base quantity."""
         return self.conn.execute(
             "INSERT INTO stock_entry_lines "
-            "(entry_id, line_no, item_id, source_warehouse_id, target_warehouse_id, qty, uom_id, rate) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(entry_id, line_no, item_id, source_warehouse_id, target_warehouse_id, "
+            "qty, uom_id, rate, base_qty) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 entry_id,
                 line_no,
                 item_id,
                 source_id,
                 target_id,
-                str(_qty(qty)),
-                uom_id,
-                str(_rate(rate)) if rate is not None else None,
+                str(quantize_qty(conversion.txn_qty)),
+                conversion.uom_id,
+                str(quantize_rate(rate)) if rate is not None else None,
+                str(conversion.base_qty),
             ),
         ).lastrowid
 
@@ -855,11 +835,11 @@ class InventoryService:
                 item_id,
                 warehouse_id,
                 posting,
-                str(_qty(qty_change)),
-                str(_rate(valuation_rate)),
-                str(_money(value_change)),
-                str(_qty(qty_after)),
-                str(_money(value_after)),
+                str(quantize_qty(qty_change)),
+                str(quantize_rate(valuation_rate)),
+                str(quantize_money(value_change)),
+                str(quantize_qty(qty_after)),
+                str(quantize_money(value_after)),
                 _now(),
             ),
         ).lastrowid
@@ -867,7 +847,7 @@ class InventoryService:
     def _write_journal(self, journal_id: int, lines: list[tuple]) -> None:
         debit_total = sum((line[1] for line in lines), Decimal("0"))
         credit_total = sum((line[2] for line in lines), Decimal("0"))
-        if _money(debit_total) != _money(credit_total):
+        if quantize_money(debit_total) != quantize_money(credit_total):
             raise ValidationError("journal entry is not balanced")
         for account, debit, credit, item_id, warehouse_id in lines:
             self.conn.execute(
@@ -877,8 +857,8 @@ class InventoryService:
                 (
                     journal_id,
                     account,
-                    str(_money(debit)),
-                    str(_money(credit)),
+                    str(quantize_money(debit)),
+                    str(quantize_money(credit)),
                     item_id,
                     warehouse_id,
                 ),

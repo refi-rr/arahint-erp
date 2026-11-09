@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS stock_entry_lines (
     qty TEXT NOT NULL,
     uom_id INTEGER NOT NULL REFERENCES uoms(id),
     rate TEXT,
+    base_qty TEXT NOT NULL DEFAULT '0',
     UNIQUE (entry_id, line_no)
 );
 
